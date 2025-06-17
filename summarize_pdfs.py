@@ -110,6 +110,10 @@ class PDFProcessor:
         """Concatenate multiple PDF files into one."""
         print(f"\n🔗 Concatenating {len(pdf_files)} PDF files...")
         
+        output_path = self.output_dir / 'concatenated.pdf'
+        
+        # Note: Previous outputs already cleaned up in process_pdfs()
+        
         merger = PyPDF2.PdfMerger()
         
         for i, pdf_file in enumerate(pdf_files, 1):
@@ -121,13 +125,12 @@ class PDFProcessor:
                 print(f"   ⚠️  Warning: Could not add {pdf_file.name}: {e}")
                 continue
         
-        output_path = self.output_dir / 'concatenated.pdf'
-        print(f"   💾 Saving concatenated PDF...")
+        print(f"   💾 Saving fresh concatenated PDF...")
         with open(output_path, 'wb') as output_file:
             merger.write(output_file)
         
         merger.close()
-        print(f"✅ Concatenated PDF saved to: {output_path.name}")
+        print(f"✅ Fresh concatenated PDF saved to: {output_path.name}")
         return output_path
     
     def count_pages(self, pdf_path: Path) -> int:
@@ -484,9 +487,42 @@ Chunk summaries:
             print(f"   📝 Saved as text file instead: {text_path.name}")
             return text_path
     
+    def _cleanup_previous_outputs(self):
+        """Clean up previous output files for a fresh run."""
+        print("🧹 Cleaning up previous outputs...")
+        
+        # Files to clean up
+        cleanup_files = [
+            'concatenated.pdf',
+            'final_summary.pdf',
+            'timeline.pdf',
+            'dramatis_personae.pdf'
+        ]
+        
+        cleaned_count = 0
+        for filename in cleanup_files:
+            file_path = self.output_dir / filename
+            if file_path.exists():
+                file_path.unlink()
+                cleaned_count += 1
+        
+        # Clean up chunk summaries
+        chunk_pattern = self.output_dir.glob('chunk_*_summary.pdf')
+        for chunk_file in chunk_pattern:
+            chunk_file.unlink()
+            cleaned_count += 1
+        
+        if cleaned_count > 0:
+            print(f"   🗑️  Removed {cleaned_count} previous output files")
+        else:
+            print("   ✅ No previous outputs to clean")
+    
     def process_pdfs(self):
         """Main processing function."""
         try:
+            # Clean up any existing output files for fresh run
+            self._cleanup_previous_outputs()
+            
             # Find PDF files
             pdf_files = self.find_pdf_files()
             print(f"\n🎯 Processing {len(pdf_files)} PDF files")
