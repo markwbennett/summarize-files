@@ -16,6 +16,8 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 import time
+import signal
+import pdfplumber
 
 # Load environment variables
 load_dotenv()
@@ -113,21 +115,82 @@ class PDFProcessor:
     
     def count_pages(self, pdf_path: Path) -> int:
         """Count the number of pages in a PDF."""
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            return len(reader.pages)
+        print(f"   📊 Counting pages in PDF...")
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                page_count = len(reader.pages)
+                print(f"   ✅ PDF contains {page_count} pages")
+                return page_count
+        except Exception as e:
+            print(f"   ❌ Error reading PDF: {e}")
+            raise
     
     def extract_text_from_pages(self, pdf_path: Path, start_page: int, end_page: int) -> str:
-        """Extract text from a range of pages."""
+        """Extract text from a range of pages with fallback methods."""
+        print(f"      📖 Extracting text from pages {start_page+1} to {end_page}...")
+        
+        # Try PyPDF2 first
+        try:
+            return self._extract_with_pypdf2(pdf_path, start_page, end_page)
+        except Exception as e:
+            print(f"      ⚠️  PyPDF2 failed: {e}")
+            print(f"      🔄 Trying alternative method with pdfplumber...")
+            return self._extract_with_pdfplumber(pdf_path, start_page, end_page)
+    
+    def _extract_with_pypdf2(self, pdf_path: Path, start_page: int, end_page: int) -> str:
+        """Extract text using PyPDF2."""
         with open(pdf_path, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
             text = ""
+            total_pages = min(end_page, len(reader.pages)) - start_page
             
-            for page_num in range(start_page, min(end_page, len(reader.pages))):
+            for i, page_num in enumerate(range(start_page, min(end_page, len(reader.pages)))):
+                if i % 10 == 0 or i == total_pages - 1:  # Progress every 10 pages or last page
+                    print(f"         Processing page {page_num + 1} ({i + 1}/{total_pages})...")
+                
                 page = reader.pages[page_num]
-                text += page.extract_text() + "\n"
+                page_text = page.extract_text()
+                
+                if not page_text.strip():
+                    print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
+                
+                text += page_text + "\n"
             
+            if not text.strip():
+                raise ValueError(f"No text extracted with PyPDF2")
+            
+            print(f"      ✅ PyPDF2 extracted {len(text)} characters from {total_pages} pages")
             return text
+    
+    def _extract_with_pdfplumber(self, pdf_path: Path, start_page: int, end_page: int) -> str:
+        """Extract text using pdfplumber as fallback."""
+        text = ""
+        total_pages = end_page - start_page
+        
+        with pdfplumber.open(pdf_path) as pdf:
+            for i, page_num in enumerate(range(start_page, min(end_page, len(pdf.pages)))):
+                if i % 10 == 0 or i == total_pages - 1:
+                    print(f"         Processing page {page_num + 1} ({i + 1}/{total_pages})...")
+                
+                try:
+                    page = pdf.pages[page_num]
+                    page_text = page.extract_text()
+                    
+                    if page_text:
+                        text += page_text + "\n"
+                    else:
+                        print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
+                        
+                except Exception as e:
+                    print(f"         ❌ Error extracting page {page_num + 1}: {e}")
+                    continue
+        
+        if not text.strip():
+            raise ValueError(f"No text could be extracted from pages {start_page+1}-{end_page}. The PDF may be image-based or corrupted.")
+        
+        print(f"      ✅ pdfplumber extracted {len(text)} characters from {total_pages} pages")
+        return text
     
     def create_chunks(self, pdf_path: Path, max_pages: int = 100, overlap: int = 10) -> List[Tuple[int, int, str]]:
         """Split PDF into overlapping chunks."""
@@ -138,9 +201,12 @@ class PDFProcessor:
         if total_pages <= max_pages:
             # Single chunk
             print(f"   ✅ Document fits in single chunk (≤{max_pages} pages)")
-            print(f"   🔍 Extracting text from all pages...")
-            text = self.extract_text_from_pages(pdf_path, 0, total_pages)
-            return [(0, total_pages, text)]
+            try:
+                text = self.extract_text_from_pages(pdf_path, 0, total_pages)
+                return [(0, total_pages, text)]
+            except Exception as e:
+                print(f"   ❌ Error extracting text: {e}")
+                raise
         
         print(f"   📚 Document requires chunking (>{max_pages} pages)")
         print(f"   ⚙️  Using {overlap}-page overlap between chunks")
@@ -152,8 +218,13 @@ class PDFProcessor:
         while start_page < total_pages:
             end_page = min(start_page + max_pages, total_pages)
             print(f"   🔍 Extracting chunk {chunk_num} (pages {start_page+1}-{end_page})...")
-            text = self.extract_text_from_pages(pdf_path, start_page, end_page)
-            chunks.append((start_page, end_page, text))
+            try:
+                text = self.extract_text_from_pages(pdf_path, start_page, end_page)
+                chunks.append((start_page, end_page, text))
+            except Exception as e:
+                print(f"   ❌ Error extracting chunk {chunk_num}: {e}")
+                # Continue with next chunk instead of failing completely
+                print(f"   ⚠️  Skipping chunk {chunk_num} and continuing...")
             
             # Move to next chunk with overlap
             start_page = end_page - overlap
