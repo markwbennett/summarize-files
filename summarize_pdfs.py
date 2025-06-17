@@ -49,8 +49,16 @@ class PDFProcessor:
                 print("Please enter a valid folder path.")
                 continue
             
+            # Remove surrounding quotes if present
+            if (folder_path.startswith('"') and folder_path.endswith('"')) or \
+               (folder_path.startswith("'") and folder_path.endswith("'")):
+                folder_path = folder_path[1:-1]
+            
             # Expand user home directory if needed
             folder_path = os.path.expanduser(folder_path)
+            
+            # Convert to absolute path to handle relative paths
+            folder_path = os.path.abspath(folder_path)
             
             if not os.path.exists(folder_path):
                 print(f"Folder '{folder_path}' does not exist. Please try again.")

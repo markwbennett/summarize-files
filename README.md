@@ -36,6 +36,10 @@ A tool to concatenate multiple PDFs, split them into manageable chunks, and gene
    ```
 
 2. When prompted, enter the path to the folder containing your PDF files
+   - Supports paths with spaces: `/Users/username/My Documents/PDFs`
+   - Works with or without quotes: `"/path/with spaces"` or `/path/with spaces`
+   - Supports relative paths: `./pdfs` or `../documents`
+   - Expands home directory: `~/Documents/PDFs`
 
 3. Results will be saved as PDF files in the same folder as your input PDFs
 
