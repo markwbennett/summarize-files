@@ -21,6 +21,8 @@ import pdfplumber
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 # Load environment variables
 load_dotenv()
@@ -159,20 +161,20 @@ class PDFProcessor:
             return self._extract_with_pdfplumber(pdf_path, start_page, end_page)
     
     def _extract_with_pypdf2(self, pdf_path: Path, start_page: int, end_page: int) -> str:
-        """Extract text using PyPDF2."""
+        """Extract text using PyPDF2 with timeout protection."""
         with open(pdf_path, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
             text = ""
             total_pages = min(end_page, len(reader.pages)) - start_page
             
             for i, page_num in enumerate(range(start_page, min(end_page, len(reader.pages)))):
-                if i % 10 == 0 or i == total_pages - 1:  # Progress every 10 pages or last page
+                if i % 5 == 0 or i == total_pages - 1:  # Progress every 5 pages or last page
                     print(f"         Processing page {page_num + 1} ({i + 1}/{total_pages})...")
                 
-                page = reader.pages[page_num]
-                page_text = page.extract_text()
+                # Extract page text with timeout
+                page_text = self._extract_single_page_with_timeout(reader, page_num, pdf_path)
                 
-                if not page_text.strip():
+                if not page_text or not page_text.strip():
                     print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
                     # Try OCR if available
                     ocr_text = self._ocr_page(pdf_path, page_num)
@@ -180,13 +182,63 @@ class PDFProcessor:
                         page_text = ocr_text
                         print(f"         ✅ OCR recovered text from page {page_num + 1}")
                 
-                text += page_text + "\n"
+                if page_text:
+                    text += page_text + "\n"
             
             if not text.strip():
                 raise ValueError(f"No text extracted with PyPDF2")
             
             print(f"      ✅ PyPDF2 extracted {len(text)} characters from {total_pages} pages")
             return text
+    
+    def _extract_single_page_with_timeout(self, reader, page_num: int, pdf_path: Path, timeout: int = 10) -> str:
+        """Extract text from a single page with timeout protection."""
+        def extract_page():
+            try:
+                page = reader.pages[page_num]
+                return page.extract_text()
+            except Exception as e:
+                print(f"         ❌ PyPDF2 error on page {page_num + 1}: {e}")
+                return None
+        
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(extract_page)
+                result = future.result(timeout=timeout)
+                return result if result is not None else ""
+        except FuturesTimeoutError:
+            print(f"         ⏰ PyPDF2 timeout on page {page_num + 1} (>{timeout}s) - trying OCR...")
+            # If PyPDF2 times out, try OCR directly
+            ocr_text = self._ocr_page(pdf_path, page_num)
+            if ocr_text:
+                print(f"         ✅ OCR recovered text after timeout")
+                return ocr_text
+            return ""
+        except Exception as e:
+            print(f"         ❌ Unexpected error on page {page_num + 1}: {e}")
+            return ""
+    
+    def _extract_pdfplumber_page_with_timeout(self, pdf, page_num: int, timeout: int = 10) -> str:
+        """Extract text from a single page using pdfplumber with timeout protection."""
+        def extract_page():
+            try:
+                page = pdf.pages[page_num]
+                return page.extract_text()
+            except Exception as e:
+                print(f"         ❌ pdfplumber error on page {page_num + 1}: {e}")
+                return None
+        
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(extract_page)
+                result = future.result(timeout=timeout)
+                return result if result is not None else ""
+        except FuturesTimeoutError:
+            print(f"         ⏰ pdfplumber timeout on page {page_num + 1} (>{timeout}s) - skipping...")
+            return ""
+        except Exception as e:
+            print(f"         ❌ Unexpected pdfplumber error on page {page_num + 1}: {e}")
+            return ""
     
     def _extract_with_pdfplumber(self, pdf_path: Path, start_page: int, end_page: int) -> str:
         """Extract text using pdfplumber as fallback."""
@@ -195,26 +247,21 @@ class PDFProcessor:
         
         with pdfplumber.open(pdf_path) as pdf:
             for i, page_num in enumerate(range(start_page, min(end_page, len(pdf.pages)))):
-                if i % 10 == 0 or i == total_pages - 1:
+                if i % 5 == 0 or i == total_pages - 1:
                     print(f"         Processing page {page_num + 1} ({i + 1}/{total_pages})...")
                 
-                try:
-                    page = pdf.pages[page_num]
-                    page_text = page.extract_text()
-                    
-                    if page_text and page_text.strip():
-                        text += page_text + "\n"
-                    else:
-                        print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
-                        # Try OCR if available
-                        ocr_text = self._ocr_page(pdf_path, page_num)
-                        if ocr_text:
-                            text += ocr_text + "\n"
-                            print(f"         ✅ OCR recovered text from page {page_num + 1}")
-                        
-                except Exception as e:
-                    print(f"         ❌ Error extracting page {page_num + 1}: {e}")
-                    continue
+                # Extract page text with timeout
+                page_text = self._extract_pdfplumber_page_with_timeout(pdf, page_num)
+                
+                if page_text and page_text.strip():
+                    text += page_text + "\n"
+                else:
+                    print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
+                    # Try OCR if available
+                    ocr_text = self._ocr_page(pdf_path, page_num)
+                    if ocr_text:
+                        text += ocr_text + "\n"
+                        print(f"         ✅ OCR recovered text from page {page_num + 1}")
         
         if not text.strip():
             raise ValueError(f"No text could be extracted from pages {start_page+1}-{end_page}. The PDF may be image-based or corrupted.")
