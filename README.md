@@ -37,12 +37,14 @@ A tool to concatenate multiple PDFs, split them into manageable chunks, and gene
 
 2. When prompted, enter the path to the folder containing your PDF files
 
-3. Results will be saved in the `output/` directory
+3. Results will be saved as PDF files in the same folder as your input PDFs
 
 ## Output
 
+All output files are saved as PDFs in the same directory as your input files:
+
 - `concatenated.pdf` - Combined PDF file
-- `summaries/` - Individual chunk summaries
-- `final_summary.txt` - Overall summary
-- `timeline.txt` - Extracted timeline
-- `dramatis_personae.txt` - Character/person list 
+- `final_summary.pdf` - Comprehensive overall summary
+- `timeline.pdf` - Chronological timeline of events
+- `dramatis_personae.pdf` - Key people and characters
+- `chunk_X_summary.pdf` - Individual chunk summaries (if document was split) 
