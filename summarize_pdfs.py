@@ -16,13 +16,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class PDFProcessor:
-    def __init__(self):
+    def __init__(self, pdfs_folder: str = None):
         self.api_key = os.getenv('ANTHROPIC_API_KEY')
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
         
         self.client = Anthropic(api_key=self.api_key)
-        self.pdfs_dir = Path('pdfs')
+        
+        # Get PDF folder from user input if not provided
+        if pdfs_folder is None:
+            pdfs_folder = self.get_pdf_folder()
+        
+        self.pdfs_dir = Path(pdfs_folder)
         self.output_dir = Path('output')
         self.summaries_dir = Path('summaries')
         
@@ -30,15 +35,38 @@ class PDFProcessor:
         self.output_dir.mkdir(exist_ok=True)
         self.summaries_dir.mkdir(exist_ok=True)
     
+    def get_pdf_folder(self) -> str:
+        """Prompt user for PDF folder location."""
+        while True:
+            folder_path = input("Enter the path to the folder containing PDF files: ").strip()
+            
+            if not folder_path:
+                print("Please enter a valid folder path.")
+                continue
+            
+            # Expand user home directory if needed
+            folder_path = os.path.expanduser(folder_path)
+            
+            if not os.path.exists(folder_path):
+                print(f"Folder '{folder_path}' does not exist. Please try again.")
+                continue
+            
+            if not os.path.isdir(folder_path):
+                print(f"'{folder_path}' is not a directory. Please try again.")
+                continue
+            
+            # Check if folder contains any PDF files
+            pdf_files = list(Path(folder_path).glob('*.pdf'))
+            if not pdf_files:
+                print(f"No PDF files found in '{folder_path}'. Please try again.")
+                continue
+            
+            print(f"Found {len(pdf_files)} PDF files in '{folder_path}'")
+            return folder_path
+    
     def find_pdf_files(self) -> List[Path]:
-        """Find all PDF files in the pdfs directory."""
-        if not self.pdfs_dir.exists():
-            raise FileNotFoundError(f"Directory {self.pdfs_dir} not found")
-        
+        """Find all PDF files in the specified directory."""
         pdf_files = list(self.pdfs_dir.glob('*.pdf'))
-        if not pdf_files:
-            raise FileNotFoundError(f"No PDF files found in {self.pdfs_dir}")
-        
         # Sort by filename for consistent ordering
         return sorted(pdf_files)
     
@@ -275,6 +303,8 @@ Chunk summaries:
 
 def main():
     """Main entry point."""
+    print("PDF Summarization Tool")
+    print("=" * 50)
     processor = PDFProcessor()
     processor.process_pdfs()
 

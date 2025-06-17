@@ -66,8 +66,8 @@ def main():
     print("\n🎉 Setup complete!")
     print("\nNext steps:")
     print("1. Edit .env file and add your ANTHROPIC_API_KEY")
-    print("2. Place PDF files in the pdfs/ directory")
-    print("3. Run: python summarize_pdfs.py")
+    print("2. Run: python summarize_pdfs.py")
+    print("3. When prompted, enter the path to your PDF folder")
     print(f"\nTo activate virtual environment: {activate_cmd}")
 
 if __name__ == "__main__":

@@ -30,11 +30,12 @@ A tool to concatenate multiple PDFs, split them into manageable chunks, and gene
 
 ## Usage
 
-1. Place PDF files in the `pdfs/` directory
-2. Run the summarization tool:
+1. Run the summarization tool:
    ```bash
    python summarize_pdfs.py
    ```
+
+2. When prompted, enter the path to the folder containing your PDF files
 
 3. Results will be saved in the `output/` directory
 
