@@ -171,22 +171,19 @@ class PDFProcessor:
         """Check if PDF has characteristics that cause PyPDF2 to hang."""
         filename = pdf_path.name.lower()
         
-        # Known problematic patterns
-        problematic_patterns = [
-            'businessreport',  # Business reports often have complex tables
-            'agha engineering',  # Specific file mentioned by user
-            'table of contents',  # TOC pages often problematic
-        ]
+        # AGHA Engineering business reports are definitively problematic
+        if 'agha engineering' in filename and 'businessreport' in filename:
+            print(f"      🚨 Known problematic PDF: AGHA Engineering business report")
+            return True
         
-        for pattern in problematic_patterns:
-            if pattern in filename:
-                return True
-        
-        # Quick check for file size - very large files often problematic
+        # Very small business reports often have structural issues
         try:
-            file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
-            if file_size_mb > 50:  # Files over 50MB
-                print(f"      📊 Large PDF detected ({file_size_mb:.1f}MB)")
+            file_size_kb = pdf_path.stat().st_size / 1024
+            if file_size_kb < 50 and 'businessreport' in filename:
+                print(f"      ⚠️  Small business report PDF ({file_size_kb:.1f}KB) - likely problematic")
+                return True
+            elif file_size_kb > 50000:  # Very large files (>50MB)
+                print(f"      📊 Large PDF detected ({file_size_kb/1024:.1f}MB)")
                 return True
         except:
             pass
@@ -269,12 +266,28 @@ class PDFProcessor:
     
     def _is_likely_problematic_page(self, pdf_path: Path, page_num: int) -> bool:
         """Check if a specific page is likely to be problematic."""
-        # First few pages of business reports often have complex layouts
-        if page_num < 5 and 'businessreport' in pdf_path.name.lower():
+        # Known problematic file patterns
+        filename = pdf_path.name.lower()
+        
+        # AGHA Engineering business reports are known to hang on first page
+        if 'agha engineering' in filename and 'businessreport' in filename:
+            if page_num == 0:  # First page (table of contents)
+                print(f"         🚨 Known problematic page: AGHA Engineering business report page 1")
+                return True
+        
+        # General business report patterns
+        if 'businessreport' in filename and page_num < 3:
             return True
-        # Table of contents pages (usually early in document)
-        if page_num < 10:
-            return True
+            
+        # Very small PDFs with few pages often have layout issues
+        try:
+            file_size_kb = pdf_path.stat().st_size / 1024
+            if file_size_kb < 50 and page_num < 2:  # Small files, early pages
+                print(f"         ⚠️  Small PDF ({file_size_kb:.1f}KB) - early page may be problematic")
+                return True
+        except:
+            pass
+            
         return False
     
     def _extract_page_with_process_timeout(self, pdf_path: Path, page_num: int, timeout: int) -> str:
