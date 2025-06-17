@@ -23,6 +23,8 @@ from pdf2image import convert_from_path
 from PIL import Image
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import subprocess
+import multiprocessing
 
 # Load environment variables
 load_dotenv()
@@ -152,6 +154,11 @@ class PDFProcessor:
         """Extract text from a range of pages with fallback methods."""
         print(f"      📖 Extracting text from pages {start_page+1} to {end_page}...")
         
+        # Check if this PDF has known problematic characteristics
+        if self._is_problematic_pdf(pdf_path):
+            print(f"      ⚠️  PDF appears problematic - skipping PyPDF2, using pdfplumber directly")
+            return self._extract_with_pdfplumber(pdf_path, start_page, end_page)
+        
         # Try PyPDF2 first
         try:
             return self._extract_with_pypdf2(pdf_path, start_page, end_page)
@@ -159,6 +166,32 @@ class PDFProcessor:
             print(f"      ⚠️  PyPDF2 failed: {e}")
             print(f"      🔄 Trying alternative method with pdfplumber...")
             return self._extract_with_pdfplumber(pdf_path, start_page, end_page)
+    
+    def _is_problematic_pdf(self, pdf_path: Path) -> bool:
+        """Check if PDF has characteristics that cause PyPDF2 to hang."""
+        filename = pdf_path.name.lower()
+        
+        # Known problematic patterns
+        problematic_patterns = [
+            'businessreport',  # Business reports often have complex tables
+            'agha engineering',  # Specific file mentioned by user
+            'table of contents',  # TOC pages often problematic
+        ]
+        
+        for pattern in problematic_patterns:
+            if pattern in filename:
+                return True
+        
+        # Quick check for file size - very large files often problematic
+        try:
+            file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
+            if file_size_mb > 50:  # Files over 50MB
+                print(f"      📊 Large PDF detected ({file_size_mb:.1f}MB)")
+                return True
+        except:
+            pass
+        
+        return False
     
     def _extract_with_pypdf2(self, pdf_path: Path, start_page: int, end_page: int) -> str:
         """Extract text using PyPDF2 with timeout protection."""
@@ -202,9 +235,14 @@ class PDFProcessor:
             print(f"      ✅ PyPDF2 extracted {len(text)} characters from {total_pages} pages")
             return text
     
-    def _extract_single_page_with_timeout(self, reader, page_num: int, pdf_path: Path, timeout: int = 3) -> str:
+    def _extract_single_page_with_timeout(self, reader, page_num: int, pdf_path: Path, timeout: int = 2) -> str:
         """Extract text from a single page with timeout protection."""
         print(f"         🔍 Attempting PyPDF2 extraction on page {page_num + 1}...")
+        
+        # For very problematic pages, use process-based timeout
+        if self._is_likely_problematic_page(pdf_path, page_num):
+            print(f"         ⚠️  Page {page_num + 1} appears to be problematic type - using process timeout")
+            return self._extract_page_with_process_timeout(pdf_path, page_num, timeout)
         
         def extract_page():
             try:
@@ -223,10 +261,36 @@ class PDFProcessor:
                 return result if result is not None else ""
         except FuturesTimeoutError:
             print(f"         ⏰ PyPDF2 timeout on page {page_num + 1} (>{timeout}s)")
-            print(f"         🔄 Skipping PyPDF2 for this page - will try pdfplumber fallback")
-            return None  # Signal to skip this page and let pdfplumber handle it
+            print(f"         🔄 Trying process-based extraction...")
+            return self._extract_page_with_process_timeout(pdf_path, page_num, timeout)
         except Exception as e:
             print(f"         ❌ Unexpected error on page {page_num + 1}: {e}")
+            return ""
+    
+    def _is_likely_problematic_page(self, pdf_path: Path, page_num: int) -> bool:
+        """Check if a specific page is likely to be problematic."""
+        # First few pages of business reports often have complex layouts
+        if page_num < 5 and 'businessreport' in pdf_path.name.lower():
+            return True
+        # Table of contents pages (usually early in document)
+        if page_num < 10:
+            return True
+        return False
+    
+    def _extract_page_with_process_timeout(self, pdf_path: Path, page_num: int, timeout: int) -> str:
+        """Extract page using OCR directly when PyPDF2 hangs."""
+        print(f"         🚨 Using OCR fallback for page {page_num + 1}")
+        try:
+            # Skip PyPDF2 entirely and go straight to OCR
+            ocr_text = self._ocr_page(pdf_path, page_num)
+            if ocr_text:
+                print(f"         ✅ OCR extracted text from problematic page {page_num + 1}")
+                return ocr_text
+            else:
+                print(f"         ⚠️  OCR found no text on page {page_num + 1}")
+                return ""
+        except Exception as e:
+            print(f"         ❌ OCR also failed on page {page_num + 1}: {e}")
             return ""
     
     def _extract_pdfplumber_page_with_timeout(self, pdf, page_num: int, timeout: int = 10) -> str:
