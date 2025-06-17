@@ -18,6 +18,9 @@ from reportlab.lib.units import inch
 import time
 import signal
 import pdfplumber
+import pytesseract
+from pdf2image import convert_from_path
+from PIL import Image
 
 # Load environment variables
 load_dotenv()
@@ -41,6 +44,9 @@ class PDFProcessor:
         
         # Create summaries subdirectory if it doesn't exist
         self.summaries_dir.mkdir(exist_ok=True)
+        
+        # Check if Tesseract is available
+        self.ocr_available = self._check_tesseract()
     
     def get_pdf_folder(self) -> str:
         """Prompt user for PDF folder location."""
@@ -82,6 +88,17 @@ class PDFProcessor:
             if len(pdf_files) > 5:
                 print(f"   ... and {len(pdf_files) - 5} more files")
             return folder_path
+    
+    def _check_tesseract(self) -> bool:
+        """Check if Tesseract OCR is available."""
+        try:
+            pytesseract.get_tesseract_version()
+            print("✅ Tesseract OCR is available for image-based PDFs")
+            return True
+        except Exception:
+            print("⚠️  Tesseract OCR not found - image-only pages will be skipped")
+            print("   Install with: brew install tesseract (Mac) or apt-get install tesseract-ocr (Linux)")
+            return False
     
     def find_pdf_files(self) -> List[Path]:
         """Find all PDF files in the specified directory."""
@@ -154,6 +171,11 @@ class PDFProcessor:
                 
                 if not page_text.strip():
                     print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
+                    # Try OCR if available
+                    ocr_text = self._ocr_page(pdf_path, page_num)
+                    if ocr_text:
+                        page_text = ocr_text
+                        print(f"         ✅ OCR recovered text from page {page_num + 1}")
                 
                 text += page_text + "\n"
             
@@ -177,10 +199,15 @@ class PDFProcessor:
                     page = pdf.pages[page_num]
                     page_text = page.extract_text()
                     
-                    if page_text:
+                    if page_text and page_text.strip():
                         text += page_text + "\n"
                     else:
                         print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
+                        # Try OCR if available
+                        ocr_text = self._ocr_page(pdf_path, page_num)
+                        if ocr_text:
+                            text += ocr_text + "\n"
+                            print(f"         ✅ OCR recovered text from page {page_num + 1}")
                         
                 except Exception as e:
                     print(f"         ❌ Error extracting page {page_num + 1}: {e}")
@@ -191,6 +218,40 @@ class PDFProcessor:
         
         print(f"      ✅ pdfplumber extracted {len(text)} characters from {total_pages} pages")
         return text
+    
+    def _ocr_page(self, pdf_path: Path, page_num: int) -> str:
+        """OCR a single page if it appears to be image-only."""
+        if not self.ocr_available:
+            return ""
+        
+        try:
+            print(f"         🔍 Running OCR on page {page_num + 1}...")
+            
+            # Convert specific page to image
+            images = convert_from_path(
+                pdf_path, 
+                first_page=page_num + 1, 
+                last_page=page_num + 1,
+                dpi=300,  # High DPI for better OCR accuracy
+                fmt='JPEG'
+            )
+            
+            if not images:
+                return ""
+            
+            # OCR the image
+            image = images[0]
+            ocr_text = pytesseract.image_to_string(image, lang='eng')
+            
+            if ocr_text.strip():
+                return ocr_text.strip()
+            else:
+                print(f"         ⚠️  OCR found no text on page {page_num + 1}")
+                return ""
+                
+        except Exception as e:
+            print(f"         ❌ OCR failed for page {page_num + 1}: {e}")
+            return ""
     
     def create_chunks(self, pdf_path: Path, max_pages: int = 100, overlap: int = 10) -> List[Tuple[int, int, str]]:
         """Split PDF into overlapping chunks."""

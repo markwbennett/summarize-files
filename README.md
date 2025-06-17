@@ -6,24 +6,39 @@ A tool to concatenate multiple PDFs, split them into manageable chunks, and gene
 
 - Concatenate multiple PDF files
 - Split large documents into overlapping chunks (max 100 pages per chunk)
+- **OCR support** for image-based or scanned PDFs using Tesseract
+- Automatic fallback between PyPDF2 and pdfplumber for text extraction
 - Generate individual document summaries
 - Create overall summary of entire document set
 - Extract timeline and dramatis personae
+- Rich terminal feedback with progress tracking
 
 ## Setup
 
-1. Create virtual environment:
+1. Install Tesseract OCR (for image-based PDFs):
+   ```bash
+   # macOS
+   brew install tesseract
+   
+   # Ubuntu/Debian
+   sudo apt-get install tesseract-ocr
+   
+   # Windows
+   # Download from: https://github.com/UB-Mannheim/tesseract/wiki
+   ```
+
+2. Create virtual environment:
    ```bash
    python -m venv .venv
    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
    ```
 
-2. Install dependencies:
+3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. Set up Claude API key:
+4. Set up Claude API key:
    ```bash
    export ANTHROPIC_API_KEY="your-api-key-here"
    ```
