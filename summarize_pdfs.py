@@ -20,9 +20,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class PDFProcessor:
-    def __init__(self, pdfs_folder: str = None):
+    def __init__(self, pdfs_folder: str = None, individual_only: bool = False):
         """Initialize PDF processor with optional folder path."""
         self.pdfs_folder = pdfs_folder
+        self.individual_only = individual_only
         self.folder_path = None  # Cache the folder path
         self.client = None
         self._setup_anthropic()
@@ -215,9 +216,8 @@ class PDFProcessor:
         patterns = [
             "chunk_*.pdf",
             "concatenated_document.pdf",
-            "*_summary.pdf",
-            "*_timeline.pdf", 
-            "*_dramatis_personae.pdf"
+            "overall_*.pdf",
+            "*_individual_summary.pdf"
         ]
         
         removed_count = 0
@@ -435,72 +435,369 @@ Include everyone and everything mentioned, with their roles and relevance to the
         doc.build(story)
         return output_path
 
+    def analyze_individual_documents(self, pdf_files: List[Path], full_summary: str, timeline: str, dramatis_personae: str) -> List[Path]:
+        """Analyze each original document individually with full context."""
+        individual_summary_files = []
+        
+        for i, pdf_file in enumerate(pdf_files, 1):
+            print(f"   📄 Analyzing {pdf_file.name} ({i}/{len(pdf_files)}) with full context...")
+            
+            # Read PDF as bytes and encode to base64
+            import base64
+            with open(pdf_file, 'rb') as f:
+                pdf_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            # Check file size to ensure it's under Claude's limits
+            file_size_mb = pdf_file.stat().st_size / (1024 * 1024)
+            encoded_size_mb = file_size_mb * 1.33
+            
+            if encoded_size_mb > 32:
+                print(f"      ⚠️  Skipping {pdf_file.name} - too large ({file_size_mb:.1f}MB, {encoded_size_mb:.1f}MB encoded)")
+                continue
+            
+            try:
+                start_time = time.time()
+                
+                response = self.client.messages.create(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=4000,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": pdf_data
+                                    }
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"""Please analyze this specific document in the context of the complete case/document set.
+
+FULL SUMMARY OF ALL DOCUMENTS:
+{full_summary}
+
+TIMELINE OF ALL EVENTS:
+{timeline}
+
+DRAMATIS PERSONAE (ALL PEOPLE/ENTITIES):
+{dramatis_personae}
+
+Now, please provide a focused summary of THIS SPECIFIC DOCUMENT ({pdf_file.name}) that:
+
+1. **Document Overview**: What type of document this is and its primary purpose
+2. **Key Content**: The most important information, events, or data in this document
+3. **Contextual Significance**: How this document fits into the larger case/story based on the full summary
+4. **Timeline Connections**: Which events from the timeline this document relates to or supports
+5. **People/Entity Connections**: Which people or entities from the dramatis personae are mentioned or involved
+6. **Unique Contributions**: What unique information this document provides that isn't found elsewhere
+
+Focus specifically on this document while showing how it connects to the broader context."""
+                                }
+                            ]
+                        }
+                    ]
+                )
+                
+                end_time = time.time()
+                print(f"      ✅ Analysis completed in {end_time - start_time:.1f}s")
+                
+                # Create individual summary PDF next to the original document
+                summary_content = response.content[0].text
+                summary_filename = f"{pdf_file.stem}_individual_summary.pdf"
+                summary_path = pdf_file.parent / summary_filename
+                
+                # Create the summary PDF
+                doc = SimpleDocTemplate(str(summary_path), pagesize=letter)
+                styles = getSampleStyleSheet()
+                story = []
+                
+                # Title
+                title_style = styles['Title']
+                story.append(Paragraph(f"Individual Summary: {pdf_file.name}", title_style))
+                story.append(Spacer(1, 0.2*inch))
+                
+                # Content
+                content_style = styles['Normal']
+                paragraphs = summary_content.split('\n\n')
+                for para in paragraphs:
+                    if para.strip():
+                        if para.strip().startswith('- ') or para.strip().startswith('* '):
+                            para = para.replace('- ', '• ').replace('* ', '• ')
+                        story.append(Paragraph(para.strip(), content_style))
+                        story.append(Spacer(1, 0.1*inch))
+                
+                doc.build(story)
+                individual_summary_files.append(summary_path)
+                print(f"      💾 Saved summary: {summary_filename}")
+                
+            except Exception as e:
+                print(f"      ❌ Error analyzing {pdf_file.name}: {e}")
+                continue
+        
+        return individual_summary_files
+
+    def analyze_individual_documents_with_files(self, pdf_files: List[Path], summary_file: Path, timeline_file: Path, dramatis_file: Path) -> List[Path]:
+        """Analyze each original document individually with overall PDF files as context."""
+        individual_summary_files = []
+        
+        # Read the overall files once
+        import base64
+        with open(summary_file, 'rb') as f:
+            summary_data = base64.b64encode(f.read()).decode('utf-8')
+        with open(timeline_file, 'rb') as f:
+            timeline_data = base64.b64encode(f.read()).decode('utf-8')
+        with open(dramatis_file, 'rb') as f:
+            dramatis_data = base64.b64encode(f.read()).decode('utf-8')
+        
+        for i, pdf_file in enumerate(pdf_files, 1):
+            print(f"   📄 Analyzing {pdf_file.name} ({i}/{len(pdf_files)}) with overall context files...")
+            
+            # Read PDF as bytes and encode to base64
+            with open(pdf_file, 'rb') as f:
+                pdf_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            # Check file size to ensure it's under Claude's limits
+            file_size_mb = pdf_file.stat().st_size / (1024 * 1024)
+            encoded_size_mb = file_size_mb * 1.33
+            
+            if encoded_size_mb > 32:
+                print(f"      ⚠️  Skipping {pdf_file.name} - too large ({file_size_mb:.1f}MB, {encoded_size_mb:.1f}MB encoded)")
+                continue
+            
+            try:
+                start_time = time.time()
+                
+                response = self.client.messages.create(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=4000,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": summary_data
+                                    }
+                                },
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": timeline_data
+                                    }
+                                },
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": dramatis_data
+                                    }
+                                },
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": pdf_data
+                                    }
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"""I've provided you with 4 documents:
+1. Overall Summary (overall_summary.pdf) - Complete summary of all documents
+2. Overall Timeline (overall_timeline.pdf) - Chronological timeline of all events  
+3. Overall Dramatis Personae (overall_dramatis_personae.pdf) - All people and entities
+4. Individual Document ({pdf_file.name}) - The specific document to analyze
+
+Please provide a focused summary of the INDIVIDUAL DOCUMENT ({pdf_file.name}) that:
+
+1. **Document Overview**: What type of document this is and its primary purpose
+2. **Key Content**: The most important information, events, or data in this document
+3. **Contextual Significance**: How this document fits into the larger case/story based on the overall summary
+4. **Timeline Connections**: Which events from the timeline this document relates to or supports
+5. **People/Entity Connections**: Which people or entities from the dramatis personae are mentioned or involved
+6. **Unique Contributions**: What unique information this document provides that isn't found elsewhere
+
+Focus specifically on this document while showing how it connects to the broader context from the overall files."""
+                                }
+                            ]
+                        }
+                    ]
+                )
+                
+                end_time = time.time()
+                print(f"      ✅ Analysis completed in {end_time - start_time:.1f}s")
+                
+                # Create individual summary PDF next to the original document
+                summary_content = response.content[0].text
+                summary_filename = f"{pdf_file.stem}_individual_summary.pdf"
+                summary_path = pdf_file.parent / summary_filename
+                
+                # Create the summary PDF
+                doc = SimpleDocTemplate(str(summary_path), pagesize=letter)
+                styles = getSampleStyleSheet()
+                story = []
+                
+                # Title
+                title_style = styles['Title']
+                story.append(Paragraph(f"Individual Summary: {pdf_file.name}", title_style))
+                story.append(Spacer(1, 0.2*inch))
+                
+                # Content
+                content_style = styles['Normal']
+                paragraphs = summary_content.split('\n\n')
+                for para in paragraphs:
+                    if para.strip():
+                        if para.strip().startswith('- ') or para.strip().startswith('* '):
+                            para = para.replace('- ', '• ').replace('* ', '• ')
+                        story.append(Paragraph(para.strip(), content_style))
+                        story.append(Spacer(1, 0.1*inch))
+                
+                doc.build(story)
+                individual_summary_files.append(summary_path)
+                print(f"      💾 Saved summary: {summary_filename}")
+                
+            except Exception as e:
+                print(f"      ❌ Error analyzing {pdf_file.name}: {e}")
+                continue
+        
+        return individual_summary_files
+
+    def load_existing_overall_files(self) -> tuple[Path, Path, Path]:
+        """Load existing overall summary, timeline, and dramatis personae PDF files."""
+        folder = Path(self.get_pdf_folder())
+        
+        summary_file = folder / "overall_summary.pdf"
+        timeline_file = folder / "overall_timeline.pdf"
+        dramatis_file = folder / "overall_dramatis_personae.pdf"
+        
+        if not (summary_file.exists() and timeline_file.exists() and dramatis_file.exists()):
+            raise FileNotFoundError("Overall files not found. Run full analysis first or ensure overall_summary.pdf, overall_timeline.pdf, and overall_dramatis_personae.pdf exist in the folder.")
+        
+        print(f"📋 Found existing overall files:")
+        print(f"   📄 {summary_file.name}")
+        print(f"   📅 {timeline_file.name}")
+        print(f"   👥 {dramatis_file.name}")
+        
+        return summary_file, timeline_file, dramatis_file
+
     def process_pdfs(self):
         """Main processing function."""
-        print("🚀 Starting PDF summarization process...")
-        
-        # Cleanup previous outputs
-        self._cleanup_previous_outputs()
-        
-        # Find and concatenate PDFs
-        pdf_files = self.find_pdf_files()
-        concatenated_pdf = self.concatenate_pdfs(pdf_files)
-        
-        # Create PDF chunks (30 pages with 5-page overlap for coherent summaries)
-        chunk_paths = self.create_pdf_chunks(concatenated_pdf, max_pages=30, overlap=5)
-        
-        # Analyze each chunk with cumulative context
-        chunk_summaries = []
-        cumulative_summary = ""
-        
-        for i, chunk_path in enumerate(chunk_paths, 1):
-            summary = self.analyze_pdf_chunk(chunk_path, i, len(chunk_paths), cumulative_summary)
-            chunk_summaries.append(summary)
+        if self.individual_only:
+            print("🚀 Starting individual document analysis using existing overall files...")
             
-            # Update cumulative summary for next chunk
-            if cumulative_summary:
-                cumulative_summary += f"\n\nCHUNK {i} SUMMARY:\n{summary}"
-            else:
-                cumulative_summary = f"CHUNK {i} SUMMARY:\n{summary}"
-        
-        # Generate outputs
-        print(f"\n📋 Generating final outputs...")
-        
-        final_summary = self.generate_final_summary(chunk_summaries)
-        timeline = self.extract_timeline(chunk_summaries)
-        dramatis_personae = self.extract_dramatis_personae(chunk_summaries)
-        
-        # Create PDF outputs
-        folder = Path(self.get_pdf_folder())
-        base_name = concatenated_pdf.stem
-        
-        summary_pdf = self.create_pdf_summary(
-            f"Summary: {base_name}", 
-            final_summary, 
-            f"{base_name}_summary.pdf"
-        )
-        
-        timeline_pdf = self.create_pdf_summary(
-            f"Timeline: {base_name}", 
-            timeline, 
-            f"{base_name}_timeline.pdf"
-        )
-        
-        dramatis_pdf = self.create_pdf_summary(
-            f"Dramatis Personae: {base_name}", 
-            dramatis_personae, 
-            f"{base_name}_dramatis_personae.pdf"
-        )
-        
-        print(f"\n🎉 Processing complete! Generated files:")
-        print(f"   📄 Summary: {summary_pdf.name}")
-        print(f"   📅 Timeline: {timeline_pdf.name}")
-        print(f"   👥 Dramatis Personae: {dramatis_pdf.name}")
-        print(f"   🗂️  PDF Chunks: {len(chunk_paths)} files")
+            # Find PDF files
+            pdf_files = self.find_pdf_files()
+            
+            # Load existing overall files
+            try:
+                summary_file, timeline_file, dramatis_file = self.load_existing_overall_files()
+            except FileNotFoundError as e:
+                print(f"❌ {e}")
+                return
+            
+            # Analyze each original document with full context
+            print(f"\n📋 Analyzing individual documents with existing context...")
+            individual_summaries = self.analyze_individual_documents_with_files(pdf_files, summary_file, timeline_file, dramatis_file)
+            
+            print(f"\n🎉 Individual analysis complete!")
+            print(f"   📑 Individual Document Summaries: {len(individual_summaries)} files")
+            
+        else:
+            print("🚀 Starting full PDF summarization process...")
+            
+            # Cleanup previous outputs
+            self._cleanup_previous_outputs()
+            
+            # Find and concatenate PDFs
+            pdf_files = self.find_pdf_files()
+            concatenated_pdf = self.concatenate_pdfs(pdf_files)
+            
+            # Create PDF chunks (30 pages with 5-page overlap for coherent summaries)
+            chunk_paths = self.create_pdf_chunks(concatenated_pdf, max_pages=30, overlap=5)
+            
+            # Analyze each chunk with cumulative context
+            chunk_summaries = []
+            cumulative_summary = ""
+            
+            for i, chunk_path in enumerate(chunk_paths, 1):
+                summary = self.analyze_pdf_chunk(chunk_path, i, len(chunk_paths), cumulative_summary)
+                chunk_summaries.append(summary)
+                
+                # Update cumulative summary for next chunk
+                if cumulative_summary:
+                    cumulative_summary += f"\n\nCHUNK {i} SUMMARY:\n{summary}"
+                else:
+                    cumulative_summary = f"CHUNK {i} SUMMARY:\n{summary}"
+            
+            # Generate outputs
+            print(f"\n📋 Generating final outputs...")
+            
+            final_summary = self.generate_final_summary(chunk_summaries)
+            timeline = self.extract_timeline(chunk_summaries)
+            dramatis_personae = self.extract_dramatis_personae(chunk_summaries)
+            
+            # Create PDF outputs and save text versions for individual analysis
+            folder = Path(self.get_pdf_folder())
+            
+            summary_pdf = self.create_pdf_summary(
+                f"Overall Summary", 
+                final_summary, 
+                f"overall_summary.pdf"
+            )
+            
+            timeline_pdf = self.create_pdf_summary(
+                f"Overall Timeline", 
+                timeline, 
+                f"overall_timeline.pdf"
+            )
+            
+            dramatis_pdf = self.create_pdf_summary(
+                f"Overall Dramatis Personae", 
+                dramatis_personae, 
+                f"overall_dramatis_personae.pdf"
+            )
+            
+            # Save text versions for individual analysis
+            with open(folder / "overall_summary.txt", 'w', encoding='utf-8') as f:
+                f.write(final_summary)
+            with open(folder / "overall_timeline.txt", 'w', encoding='utf-8') as f:
+                f.write(timeline)
+            with open(folder / "overall_dramatis_personae.txt", 'w', encoding='utf-8') as f:
+                f.write(dramatis_personae)
+            
+            # Analyze each original document with full context
+            print(f"\n📋 Analyzing individual documents with full context...")
+            individual_summaries = self.analyze_individual_documents(pdf_files, final_summary, timeline, dramatis_personae)
+            
+            print(f"\n🎉 Processing complete! Generated files:")
+            print(f"   📄 Summary: {summary_pdf.name}")
+            print(f"   📅 Timeline: {timeline_pdf.name}")
+            print(f"   👥 Dramatis Personae: {dramatis_pdf.name}")
+            print(f"   🗂️  PDF Chunks: {len(chunk_paths)} files")
+            print(f"   📑 Individual Document Summaries: {len(individual_summaries)} files")
 
 def main():
     """Main entry point."""
-    processor = PDFProcessor()
+    import sys
+    
+    # Check for individual-only mode
+    individual_only = "--individual-only" in sys.argv
+    
+    if individual_only:
+        print("🔍 Running in individual document analysis mode")
+        print("   Using existing overall_summary.pdf, overall_timeline.pdf, and overall_dramatis_personae.pdf")
+    
+    processor = PDFProcessor(individual_only=individual_only)
     processor.process_pdfs()
 
 if __name__ == "__main__":
