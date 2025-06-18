@@ -1,740 +1,505 @@
 #!/usr/bin/env python3
 """
-PDF Summarization Tool
-Concatenates PDFs, splits into chunks, and generates summaries using Claude API.
+PDF Summarization Tool - Creates PDF chunks for Claude API analysis
 """
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Tuple
 import PyPDF2
-from anthropic import Anthropic
-from dotenv import load_dotenv
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
-import time
-import signal
-import pdfplumber
-import pytesseract
-from pdf2image import convert_from_path
-from PIL import Image
-import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-import subprocess
-import multiprocessing
+import anthropic
+from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 class PDFProcessor:
     def __init__(self, pdfs_folder: str = None):
-        self.api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not self.api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
+        """Initialize PDF processor with optional folder path."""
+        self.pdfs_folder = pdfs_folder
+        self.folder_path = None  # Cache the folder path
+        self.client = None
+        self._setup_anthropic()
         
-        self.client = Anthropic(api_key=self.api_key)
+    def _setup_anthropic(self):
+        """Setup Anthropic client."""
+        api_key = os.getenv('ANTHROPIC_API_KEY')
+        if not api_key:
+            print("❌ ANTHROPIC_API_KEY not found in environment variables")
+            print("   Please set your API key in a .env file:")
+            print("   ANTHROPIC_API_KEY=your_key_here")
+            sys.exit(1)
         
-        # Get PDF folder from user input if not provided
-        if pdfs_folder is None:
-            pdfs_folder = self.get_pdf_folder()
-        
-        self.pdfs_dir = Path(pdfs_folder)
-        # Save outputs in the same folder as the PDFs
-        self.output_dir = self.pdfs_dir
-        self.summaries_dir = self.pdfs_dir / 'summaries'
-        
-        # Create summaries subdirectory if it doesn't exist
-        self.summaries_dir.mkdir(exist_ok=True)
-        
-        # Check if Tesseract is available
-        self.ocr_available = self._check_tesseract()
+        self.client = anthropic.Anthropic(api_key=api_key)
+        print("✅ Anthropic client initialized")
     
     def get_pdf_folder(self) -> str:
-        """Prompt user for PDF folder location."""
+        """Get PDF folder path from user or use provided one."""
+        if self.folder_path:
+            return self.folder_path
+            
+        if self.pdfs_folder:
+            folder_path = Path(self.pdfs_folder)
+            if folder_path.exists():
+                self.folder_path = str(folder_path)
+                return self.folder_path
+            else:
+                print(f"❌ Provided folder does not exist: {self.pdfs_folder}")
+        
+        # Ask user for folder
         while True:
-            folder_path = input("Enter the path to the folder containing PDF files: ").strip()
+            folder_input = input("\n📁 Enter the path to your PDFs folder: ").strip()
             
-            if not folder_path:
-                print("Please enter a valid folder path.")
-                continue
+            # Remove quotes if present
+            folder_input = folder_input.strip('"\'')
             
-            # Remove surrounding quotes if present
-            if (folder_path.startswith('"') and folder_path.endswith('"')) or \
-               (folder_path.startswith("'") and folder_path.endswith("'")):
-                folder_path = folder_path[1:-1]
+            folder_path = Path(folder_input).expanduser().resolve()
             
-            # Expand user home directory if needed
-            folder_path = os.path.expanduser(folder_path)
-            
-            # Convert to absolute path to handle relative paths
-            folder_path = os.path.abspath(folder_path)
-            
-            if not os.path.exists(folder_path):
-                print(f"Folder '{folder_path}' does not exist. Please try again.")
-                continue
-            
-            if not os.path.isdir(folder_path):
-                print(f"'{folder_path}' is not a directory. Please try again.")
-                continue
-            
-            # Check if folder contains any PDF files
-            pdf_files = list(Path(folder_path).glob('*.pdf'))
-            if not pdf_files:
-                print(f"No PDF files found in '{folder_path}'. Please try again.")
-                continue
-            
-            print(f"✅ Found {len(pdf_files)} PDF files in '{folder_path}'")
-            for pdf in pdf_files[:5]:  # Show first 5 files
-                print(f"   📄 {pdf.name}")
-            if len(pdf_files) > 5:
-                print(f"   ... and {len(pdf_files) - 5} more files")
-            return folder_path
-    
-    def _check_tesseract(self) -> bool:
-        """Check if Tesseract OCR is available."""
-        try:
-            pytesseract.get_tesseract_version()
-            print("✅ Tesseract OCR is available for image-based PDFs")
-            return True
-        except Exception:
-            print("⚠️  Tesseract OCR not found - image-only pages will be skipped")
-            print("   Install with: brew install tesseract (Mac) or apt-get install tesseract-ocr (Linux)")
-            return False
-    
+            if folder_path.exists() and folder_path.is_dir():
+                print(f"✅ Using folder: {folder_path}")
+                self.folder_path = str(folder_path)
+                return self.folder_path
+            else:
+                print(f"❌ Folder not found: {folder_path}")
+                print("   Please check the path and try again.")
+
     def find_pdf_files(self) -> List[Path]:
-        """Find all PDF files in the specified directory."""
-        pdf_files = list(self.pdfs_dir.glob('*.pdf'))
-        # Sort by filename for consistent ordering
-        return sorted(pdf_files)
-    
+        """Find all PDF files in the specified folder."""
+        folder = Path(self.get_pdf_folder())
+        pdf_files = list(folder.glob("*.pdf"))
+        
+        # Filter out our own generated files
+        excluded_patterns = ['chunk_', 'concatenated', '_summary.pdf', '_timeline.pdf', '_dramatis_personae.pdf']
+        original_pdfs = []
+        for pdf in pdf_files:
+            if not any(pattern in pdf.name for pattern in excluded_patterns):
+                original_pdfs.append(pdf)
+        
+        if not original_pdfs:
+            print(f"❌ No original PDF files found in {folder}")
+            # Check if there's a PDFs subdirectory
+            pdfs_subdir = folder / "PDFs"
+            if pdfs_subdir.exists():
+                print(f"💡 Found a 'PDFs' subdirectory. Try using: {pdfs_subdir}")
+            sys.exit(1)
+        
+        print(f"📚 Found {len(original_pdfs)} original PDF file(s):")
+        for pdf in original_pdfs:
+            print(f"   📄 {pdf.name}")
+        
+        return original_pdfs
+
     def concatenate_pdfs(self, pdf_files: List[Path]) -> Path:
-        """Concatenate multiple PDF files into one."""
-        print(f"\n🔗 Concatenating {len(pdf_files)} PDF files...")
+        """Concatenate multiple PDFs into one."""
+        if len(pdf_files) == 1:
+            print(f"📄 Using single PDF: {pdf_files[0].name}")
+            return pdf_files[0]
         
-        output_path = self.output_dir / 'concatenated.pdf'
+        print(f"🔗 Concatenating {len(pdf_files)} PDFs...")
         
-        # Note: Previous outputs already cleaned up in process_pdfs()
+        output_path = pdf_files[0].parent / "concatenated_document.pdf"
         
         merger = PyPDF2.PdfMerger()
         
-        for i, pdf_file in enumerate(pdf_files, 1):
-            print(f"   📎 Adding ({i}/{len(pdf_files)}): {pdf_file.name}")
+        for pdf_file in pdf_files:
+            print(f"   ➕ Adding {pdf_file.name}")
             try:
-                with open(pdf_file, 'rb') as file:
-                    merger.append(file)
+                merger.append(pdf_file)
             except Exception as e:
-                print(f"   ⚠️  Warning: Could not add {pdf_file.name}: {e}")
-                continue
+                print(f"   ⚠️  Error adding {pdf_file.name}: {e}")
+                print(f"   🔄 Trying to add pages individually...")
+                try:
+                    # Try to add pages one by one
+                    with open(pdf_file, 'rb') as file:
+                        reader = PyPDF2.PdfReader(file)
+                        for page_num in range(len(reader.pages)):
+                            try:
+                                merger.append(pdf_file, pages=(page_num, page_num + 1))
+                            except Exception as page_error:
+                                print(f"   ⚠️  Skipping page {page_num + 1} of {pdf_file.name}: {page_error}")
+                                continue
+                    print(f"   ✅ Added {pdf_file.name} page by page")
+                except Exception as fallback_error:
+                    print(f"   ❌ Could not add {pdf_file.name} at all: {fallback_error}")
+                    continue
         
-        print(f"   💾 Saving fresh concatenated PDF...")
-        with open(output_path, 'wb') as output_file:
-            merger.write(output_file)
-        
-        merger.close()
-        print(f"✅ Fresh concatenated PDF saved to: {output_path.name}")
-        return output_path
-    
+        try:
+            with open(output_path, 'wb') as output_file:
+                merger.write(output_file)
+            
+            merger.close()
+            print(f"✅ Concatenated PDF created: {output_path.name}")
+            return output_path
+        except Exception as e:
+            print(f"❌ Error writing concatenated PDF: {e}")
+            merger.close()
+            # If concatenation fails completely, just use the first PDF
+            print(f"🔄 Falling back to using first PDF: {pdf_files[0].name}")
+            return pdf_files[0]
+
     def count_pages(self, pdf_path: Path) -> int:
-        """Count the number of pages in a PDF."""
-        print(f"   📊 Counting pages in PDF...")
-        try:
-            with open(pdf_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                page_count = len(reader.pages)
-                print(f"   ✅ PDF contains {page_count} pages")
-                return page_count
-        except Exception as e:
-            print(f"   ❌ Error reading PDF: {e}")
-            raise
-    
-    def extract_text_from_pages(self, pdf_path: Path, start_page: int, end_page: int) -> str:
-        """Extract text from a range of pages with fallback methods."""
-        print(f"      📖 Extracting text from pages {start_page+1} to {end_page}...")
-        
-        # Check if this PDF has known problematic characteristics
-        if self._is_problematic_pdf(pdf_path):
-            print(f"      ⚠️  PDF appears problematic - skipping PyPDF2, using pdfplumber directly")
-            return self._extract_with_pdfplumber(pdf_path, start_page, end_page)
-        
-        # Try PyPDF2 first
-        try:
-            return self._extract_with_pypdf2(pdf_path, start_page, end_page)
-        except Exception as e:
-            print(f"      ⚠️  PyPDF2 failed: {e}")
-            print(f"      🔄 Trying alternative method with pdfplumber...")
-            return self._extract_with_pdfplumber(pdf_path, start_page, end_page)
-    
-    def _is_problematic_pdf(self, pdf_path: Path) -> bool:
-        """Check if PDF has characteristics that cause PyPDF2 to hang."""
-        filename = pdf_path.name.lower()
-        
-        # AGHA Engineering business reports are definitively problematic
-        if 'agha engineering' in filename and 'businessreport' in filename:
-            print(f"      🚨 Known problematic PDF: AGHA Engineering business report")
-            return True
-        
-        # Very small business reports often have structural issues
-        try:
-            file_size_kb = pdf_path.stat().st_size / 1024
-            if file_size_kb < 50 and 'businessreport' in filename:
-                print(f"      ⚠️  Small business report PDF ({file_size_kb:.1f}KB) - likely problematic")
-                return True
-            elif file_size_kb > 50000:  # Very large files (>50MB)
-                print(f"      📊 Large PDF detected ({file_size_kb/1024:.1f}MB)")
-                return True
-        except:
-            pass
-        
-        return False
-    
-    def _extract_with_pypdf2(self, pdf_path: Path, start_page: int, end_page: int) -> str:
-        """Extract text using PyPDF2 with timeout protection."""
+        """Count total pages in PDF."""
         with open(pdf_path, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
-            text = ""
-            total_pages = min(end_page, len(reader.pages)) - start_page
-            timeout_count = 0
-            max_timeouts = 3  # If more than 3 pages timeout, give up on PyPDF2
-            
-            for i, page_num in enumerate(range(start_page, min(end_page, len(reader.pages)))):
-                print(f"      📄 Processing page {page_num + 1} ({i + 1}/{total_pages})...")
-                
-                # Check if we've had too many timeouts
-                if timeout_count >= max_timeouts:
-                    print(f"         🚫 Too many PyPDF2 timeouts ({timeout_count}) - switching to pdfplumber")
-                    raise ValueError(f"PyPDF2 had {timeout_count} timeouts, switching to pdfplumber")
-                
-                # Extract page text with timeout
-                page_text = self._extract_single_page_with_timeout(reader, page_num, pdf_path)
-                
-                if page_text is None:
-                    # PyPDF2 timed out, count it and skip this page
-                    timeout_count += 1
-                    print(f"         ⏭️  Timeout #{timeout_count} - skipping page {page_num + 1} in PyPDF2")
-                    continue
-                elif not page_text or not page_text.strip():
-                    print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
-                    # Try OCR if available
-                    ocr_text = self._ocr_page(pdf_path, page_num)
-                    if ocr_text:
-                        page_text = ocr_text
-                        print(f"         ✅ OCR recovered text from page {page_num + 1}")
-                
-                if page_text:
-                    text += page_text + "\n"
-            
-            if not text.strip():
-                raise ValueError(f"No text extracted with PyPDF2")
-            
-            print(f"      ✅ PyPDF2 extracted {len(text)} characters from {total_pages} pages")
-            return text
-    
-    def _extract_single_page_with_timeout(self, reader, page_num: int, pdf_path: Path, timeout: int = 2) -> str:
-        """Extract text from a single page with timeout protection."""
-        print(f"         🔍 Attempting PyPDF2 extraction on page {page_num + 1}...")
-        
-        # For very problematic pages, use process-based timeout
-        if self._is_likely_problematic_page(pdf_path, page_num):
-            print(f"         ⚠️  Page {page_num + 1} appears to be problematic type - using process timeout")
-            return self._extract_page_with_process_timeout(pdf_path, page_num, timeout)
-        
-        def extract_page():
-            try:
-                page = reader.pages[page_num]
-                text = page.extract_text()
-                print(f"         ✅ PyPDF2 extraction completed for page {page_num + 1}")
-                return text
-            except Exception as e:
-                print(f"         ❌ PyPDF2 error on page {page_num + 1}: {e}")
-                return None
-        
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(extract_page)
-                result = future.result(timeout=timeout)
-                return result if result is not None else ""
-        except FuturesTimeoutError:
-            print(f"         ⏰ PyPDF2 timeout on page {page_num + 1} (>{timeout}s)")
-            print(f"         🔄 Trying process-based extraction...")
-            return self._extract_page_with_process_timeout(pdf_path, page_num, timeout)
-        except Exception as e:
-            print(f"         ❌ Unexpected error on page {page_num + 1}: {e}")
-            return ""
-    
-    def _is_likely_problematic_page(self, pdf_path: Path, page_num: int) -> bool:
-        """Check if a specific page is likely to be problematic."""
-        # Known problematic file patterns
-        filename = pdf_path.name.lower()
-        
-        # AGHA Engineering business reports are known to hang on first page
-        if 'agha engineering' in filename and 'businessreport' in filename:
-            if page_num == 0:  # First page (table of contents)
-                print(f"         🚨 Known problematic page: AGHA Engineering business report page 1")
-                return True
-        
-        # General business report patterns
-        if 'businessreport' in filename and page_num < 3:
-            return True
-            
-        # Very small PDFs with few pages often have layout issues
-        try:
-            file_size_kb = pdf_path.stat().st_size / 1024
-            if file_size_kb < 50 and page_num < 2:  # Small files, early pages
-                print(f"         ⚠️  Small PDF ({file_size_kb:.1f}KB) - early page may be problematic")
-                return True
-        except:
-            pass
-            
-        return False
-    
-    def _extract_page_with_process_timeout(self, pdf_path: Path, page_num: int, timeout: int) -> str:
-        """Extract page using OCR directly when PyPDF2 hangs."""
-        print(f"         🚨 Using OCR fallback for page {page_num + 1}")
-        try:
-            # Skip PyPDF2 entirely and go straight to OCR
-            ocr_text = self._ocr_page(pdf_path, page_num)
-            if ocr_text:
-                print(f"         ✅ OCR extracted text from problematic page {page_num + 1}")
-                return ocr_text
-            else:
-                print(f"         ⚠️  OCR found no text on page {page_num + 1}")
-                return ""
-        except Exception as e:
-            print(f"         ❌ OCR also failed on page {page_num + 1}: {e}")
-            return ""
-    
-    def _extract_pdfplumber_page_with_timeout(self, pdf, page_num: int, timeout: int = 10) -> str:
-        """Extract text from a single page using pdfplumber with timeout protection."""
-        def extract_page():
-            try:
-                page = pdf.pages[page_num]
-                return page.extract_text()
-            except Exception as e:
-                print(f"         ❌ pdfplumber error on page {page_num + 1}: {e}")
-                return None
-        
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(extract_page)
-                result = future.result(timeout=timeout)
-                return result if result is not None else ""
-        except FuturesTimeoutError:
-            print(f"         ⏰ pdfplumber timeout on page {page_num + 1} (>{timeout}s) - skipping...")
-            return ""
-        except Exception as e:
-            print(f"         ❌ Unexpected pdfplumber error on page {page_num + 1}: {e}")
-            return ""
-    
-    def _extract_with_pdfplumber(self, pdf_path: Path, start_page: int, end_page: int) -> str:
-        """Extract text using pdfplumber as fallback."""
-        text = ""
-        total_pages = end_page - start_page
-        
-        with pdfplumber.open(pdf_path) as pdf:
-            for i, page_num in enumerate(range(start_page, min(end_page, len(pdf.pages)))):
-                if i % 5 == 0 or i == total_pages - 1:
-                    print(f"         Processing page {page_num + 1} ({i + 1}/{total_pages})...")
-                
-                # Extract page text with timeout
-                page_text = self._extract_pdfplumber_page_with_timeout(pdf, page_num)
-                
-                if page_text and page_text.strip():
-                    text += page_text + "\n"
-                else:
-                    print(f"         ⚠️  Page {page_num + 1} appears to be empty or image-only")
-                    # Try OCR if available
-                    ocr_text = self._ocr_page(pdf_path, page_num)
-                    if ocr_text:
-                        text += ocr_text + "\n"
-                        print(f"         ✅ OCR recovered text from page {page_num + 1}")
-        
-        if not text.strip():
-            raise ValueError(f"No text could be extracted from pages {start_page+1}-{end_page}. The PDF may be image-based or corrupted.")
-        
-        print(f"      ✅ pdfplumber extracted {len(text)} characters from {total_pages} pages")
-        return text
-    
-    def _ocr_page(self, pdf_path: Path, page_num: int) -> str:
-        """OCR a single page if it appears to be image-only."""
-        if not self.ocr_available:
-            return ""
-        
-        try:
-            print(f"         🔍 Running OCR on page {page_num + 1}...")
-            
-            # Convert specific page to image
-            images = convert_from_path(
-                pdf_path, 
-                first_page=page_num + 1, 
-                last_page=page_num + 1,
-                dpi=300,  # High DPI for better OCR accuracy
-                fmt='JPEG'
-            )
-            
-            if not images:
-                return ""
-            
-            # OCR the image
-            image = images[0]
-            ocr_text = pytesseract.image_to_string(image, lang='eng')
-            
-            if ocr_text.strip():
-                return ocr_text.strip()
-            else:
-                print(f"         ⚠️  OCR found no text on page {page_num + 1}")
-                return ""
-                
-        except Exception as e:
-            print(f"         ❌ OCR failed for page {page_num + 1}: {e}")
-            return ""
-    
-    def create_chunks(self, pdf_path: Path, max_pages: int = 100, overlap: int = 10) -> List[Tuple[int, int, str]]:
-        """Split PDF into overlapping chunks."""
-        print(f"\n📊 Analyzing document structure...")
+            return len(reader.pages)
+
+    def create_pdf_chunks(self, pdf_path: Path, max_pages: int = 30, overlap: int = 5) -> List[Path]:
+        """Create PDF chunks by copying pages."""
+        print(f"\n📊 Creating PDF chunks...")
         total_pages = self.count_pages(pdf_path)
         print(f"   📖 Total pages: {total_pages}")
         
         if total_pages <= max_pages:
-            # Single chunk
-            print(f"   ✅ Document fits in single chunk (≤{max_pages} pages)")
-            try:
-                text = self.extract_text_from_pages(pdf_path, 0, total_pages)
-                return [(0, total_pages, text)]
-            except Exception as e:
-                print(f"   ❌ Error extracting text: {e}")
-                raise
-        
-        print(f"   📚 Document requires chunking (>{max_pages} pages)")
-        print(f"   ⚙️  Using {overlap}-page overlap between chunks")
+            print(f"   ✅ Document fits in single chunk ({total_pages} pages)")
+            return [pdf_path]
         
         chunks = []
-        start_page = 0
         chunk_num = 1
+        start_page = 0
         
         while start_page < total_pages:
             end_page = min(start_page + max_pages, total_pages)
-            print(f"   🔍 Extracting chunk {chunk_num} (pages {start_page+1}-{end_page})...")
-            try:
-                text = self.extract_text_from_pages(pdf_path, start_page, end_page)
-                chunks.append((start_page, end_page, text))
-            except Exception as e:
-                print(f"   ❌ Error extracting chunk {chunk_num}: {e}")
-                # Continue with next chunk instead of failing completely
-                print(f"   ⚠️  Skipping chunk {chunk_num} and continuing...")
+            
+            print(f"   📄 Creating chunk {chunk_num}: pages {start_page + 1}-{end_page}")
+            
+            # Create chunk filename
+            chunk_filename = f"chunk_{chunk_num:02d}_pages_{start_page + 1:03d}-{end_page:03d}.pdf"
+            chunk_path = pdf_path.parent / chunk_filename
+            
+            # Copy pages to chunk
+            self._create_pdf_chunk(pdf_path, chunk_path, start_page, end_page)
+            chunks.append(chunk_path)
             
             # Move to next chunk with overlap
-            start_page = end_page - overlap
-            if start_page >= total_pages:
-                break
+            start_page += max_pages - overlap
             chunk_num += 1
         
-        print(f"✅ Created {len(chunks)} chunks for processing")
+        print(f"✅ Created {len(chunks)} PDF chunks")
         return chunks
-    
-    def summarize_chunk(self, chunk_text: str, chunk_num: int, total_chunks: int) -> str:
-        """Summarize a single chunk using Claude."""
-        print(f"\n🤖 Summarizing chunk {chunk_num + 1}/{total_chunks}...")
-        print(f"   📝 Sending to Claude API...")
+
+    def _create_pdf_chunk(self, source_pdf: Path, output_pdf: Path, start_page: int, end_page: int):
+        """Create a PDF chunk by copying specific pages."""
+        with open(source_pdf, 'rb') as source_file:
+            reader = PyPDF2.PdfReader(source_file)
+            writer = PyPDF2.PdfWriter()
+            
+            # Copy pages
+            for page_num in range(start_page, min(end_page, len(reader.pages))):
+                page = reader.pages[page_num]
+                writer.add_page(page)
+            
+            # Write chunk
+            with open(output_pdf, 'wb') as output_file:
+                writer.write(output_file)
+            
+            # Check file size and warn if over Claude's limit (accounting for base64 encoding +33%)
+            file_size_mb = output_pdf.stat().st_size / (1024 * 1024)
+            encoded_size_mb = file_size_mb * 1.33  # Base64 encoding overhead
+            if encoded_size_mb > 32:
+                print(f"   ⚠️  Warning: {output_pdf.name} is {file_size_mb:.1f}MB ({encoded_size_mb:.1f}MB encoded - over Claude's 32MB limit)")
+            elif encoded_size_mb > 28:
+                print(f"   ⚠️  {output_pdf.name} is {file_size_mb:.1f}MB ({encoded_size_mb:.1f}MB encoded - approaching limit)")
+            else:
+                print(f"   ✅ {output_pdf.name} is {file_size_mb:.1f}MB ({encoded_size_mb:.1f}MB encoded)")
+
+    def _cleanup_previous_outputs(self):
+        """Remove previous output files."""
+        folder = Path(self.get_pdf_folder())
         
-        prompt = f"""Please provide a comprehensive summary of this document chunk ({chunk_num + 1} of {total_chunks}).
+        patterns = [
+            "chunk_*.pdf",
+            "concatenated_document.pdf",
+            "*_summary.pdf",
+            "*_timeline.pdf", 
+            "*_dramatis_personae.pdf"
+        ]
+        
+        removed_count = 0
+        for pattern in patterns:
+            for file in folder.glob(pattern):
+                try:
+                    file.unlink()
+                    removed_count += 1
+                except Exception as e:
+                    print(f"⚠️  Could not remove {file.name}: {e}")
+        
+        if removed_count > 0:
+            print(f"🧹 Cleaned up {removed_count} previous output files")
 
-Include:
-1. Main topics and themes
-2. Key events or developments
-3. Important people mentioned
-4. Significant dates or timeframes
-5. Critical decisions or outcomes
+    def analyze_pdf_chunk(self, chunk_path: Path, chunk_num: int, total_chunks: int, previous_summary: str = "") -> str:
+        """Send PDF chunk to Claude for analysis with previous context."""
+        print(f"🤖 Analyzing chunk {chunk_num}/{total_chunks} with Claude...")
+        
+        # Read PDF as bytes and encode to base64
+        import base64
+        with open(chunk_path, 'rb') as f:
+            pdf_data = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Build context-aware prompt
+        if previous_summary and chunk_num > 1:
+            context_text = f"""Please analyze this PDF document (chunk {chunk_num} of {total_chunks}) and provide a comprehensive summary that builds upon the previous analysis.
 
-Document text:
-{chunk_text}"""
+PREVIOUS SUMMARY FROM EARLIER CHUNKS:
+{previous_summary}
+
+For this new chunk, please:
+1. Summarize the key points, important details, dates, names, and significant information
+2. Note any connections or continuations from the previous chunks
+3. Identify any new developments or information not covered in previous summaries
+4. Be thorough and detailed while building a coherent narrative
+
+Focus on this chunk's content while maintaining awareness of the overall document context."""
+        else:
+            context_text = f"Please provide a comprehensive summary of this PDF document (chunk {chunk_num} of {total_chunks}). Include key points, important details, dates, names, and any significant information. Be thorough and detailed."
+        
+        start_time = time.time()
         
         try:
-            start_time = time.time()
             response = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
+                model="claude-3-5-sonnet-20241022",
                 max_tokens=4000,
-                messages=[{"role": "user", "content": prompt}]
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": pdf_data
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": context_text
+                            }
+                        ]
+                    }
+                ]
             )
-            elapsed_time = time.time() - start_time
-            print(f"   ✅ Summary completed in {elapsed_time:.1f}s")
+            
+            end_time = time.time()
+            print(f"   ✅ Claude analysis completed in {end_time - start_time:.1f}s")
+            
             return response.content[0].text
+            
         except Exception as e:
-            print(f"   ❌ Error summarizing chunk {chunk_num + 1}: {e}")
-            return f"Error summarizing chunk {chunk_num + 1}: {str(e)}"
-    
+            print(f"   ❌ Claude API error: {e}")
+            return f"Error analyzing chunk {chunk_num}: {str(e)}"
+
     def generate_final_summary(self, chunk_summaries: List[str]) -> str:
-        """Generate overall summary from chunk summaries."""
-        print(f"\n📋 Generating final comprehensive summary...")
-        print(f"   🔄 Combining {len(chunk_summaries)} chunk summaries...")
+        """Generate final summary from all chunks."""
+        print(f"📝 Generating final summary from {len(chunk_summaries)} chunks...")
         
-        combined_summaries = "\n\n".join([f"Chunk {i+1} Summary:\n{summary}" 
-                                        for i, summary in enumerate(chunk_summaries)])
-        
-        prompt = f"""Based on these chunk summaries of a larger document, please provide:
-
-1. **OVERALL SUMMARY**: A comprehensive summary of the entire document set
-2. **MAIN THEMES**: The key themes and topics that emerge across all chunks
-3. **CRITICAL INSIGHTS**: The most important insights or conclusions
-
-Chunk summaries:
-{combined_summaries}"""
+        combined_summaries = "\n\n".join([
+            f"CHUNK {i+1} SUMMARY:\n{summary}" 
+            for i, summary in enumerate(chunk_summaries)
+        ])
         
         try:
-            print(f"   📝 Sending to Claude API...")
-            start_time = time.time()
             response = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
+                model="claude-3-5-sonnet-20241022",
                 max_tokens=4000,
-                messages=[{"role": "user", "content": prompt}]
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"""Based on these chunk summaries from a document, please create a comprehensive final summary that synthesizes all the information:
+
+{combined_summaries}
+
+Please provide:
+1. An executive summary
+2. Key findings and main points
+3. Important details and context
+4. Any conclusions or recommendations
+
+Make this a cohesive, well-structured summary that captures the essence of the entire document."""
+                    }
+                ]
             )
-            elapsed_time = time.time() - start_time
-            print(f"   ✅ Final summary completed in {elapsed_time:.1f}s")
+            
+            print("   ✅ Final summary generated")
             return response.content[0].text
+            
         except Exception as e:
             print(f"   ❌ Error generating final summary: {e}")
             return f"Error generating final summary: {str(e)}"
-    
+
     def extract_timeline(self, chunk_summaries: List[str]) -> str:
-        """Extract timeline from chunk summaries."""
-        print(f"\n⏰ Extracting chronological timeline...")
-        print(f"   🔍 Analyzing temporal patterns...")
+        """Extract timeline from summaries."""
+        print("📅 Extracting timeline...")
         
-        combined_summaries = "\n\n".join([f"Chunk {i+1} Summary:\n{summary}" 
-                                        for i, summary in enumerate(chunk_summaries)])
-        
-        prompt = f"""Based on these document summaries, please extract and create a chronological timeline of events.
-
-Format as:
-- Date/Period: Event description
-- Date/Period: Event description
-
-Include all significant dates, events, and developments mentioned across all chunks.
-If exact dates aren't available, use approximate timeframes or relative chronology.
-
-Chunk summaries:
-{combined_summaries}"""
+        combined_summaries = "\n\n".join(chunk_summaries)
         
         try:
-            print(f"   📝 Sending to Claude API...")
-            start_time = time.time()
             response = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=4000,
-                messages=[{"role": "user", "content": prompt}]
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=2000,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"""From the following document summaries, please extract and create a chronological timeline of all events, dates, and time-based information mentioned:
+
+{combined_summaries}
+
+Format the timeline as:
+- Date/Time: Event description
+- Date/Time: Event description
+
+Include all dates, deadlines, meetings, events, and temporal references. If exact dates aren't available, use approximate timeframes mentioned."""
+                    }
+                ]
             )
-            elapsed_time = time.time() - start_time
-            print(f"   ✅ Timeline extraction completed in {elapsed_time:.1f}s")
+            
+            print("   ✅ Timeline extracted")
             return response.content[0].text
+            
         except Exception as e:
             print(f"   ❌ Error extracting timeline: {e}")
             return f"Error extracting timeline: {str(e)}"
-    
+
     def extract_dramatis_personae(self, chunk_summaries: List[str]) -> str:
-        """Extract dramatis personae from chunk summaries."""
-        print(f"\n👥 Extracting dramatis personae...")
-        print(f"   🔍 Identifying key people and characters...")
+        """Extract list of people/entities."""
+        print("👥 Extracting dramatis personae...")
         
-        combined_summaries = "\n\n".join([f"Chunk {i+1} Summary:\n{summary}" 
-                                        for i, summary in enumerate(chunk_summaries)])
-        
-        prompt = f"""Based on these document summaries, please create a dramatis personae (list of key people/characters).
-
-Format as:
-**Name** - Role/Title/Description of their significance and involvement
-
-Include:
-- All significant individuals mentioned
-- Their roles, titles, or positions
-- Brief description of their importance to the events/narrative
-- Their relationships to other key figures (if relevant)
-
-Chunk summaries:
-{combined_summaries}"""
+        combined_summaries = "\n\n".join(chunk_summaries)
         
         try:
-            print(f"   📝 Sending to Claude API...")
-            start_time = time.time()
             response = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=4000,
-                messages=[{"role": "user", "content": prompt}]
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=2000,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"""From the following document summaries, please create a dramatis personae - a comprehensive list of all people, organizations, companies, and entities mentioned:
+
+{combined_summaries}
+
+Format as:
+**PEOPLE:**
+- Name: Role/Description/Relevance
+
+**ORGANIZATIONS/COMPANIES:**
+- Name: Description/Role
+
+**OTHER ENTITIES:**
+- Name: Description
+
+Include everyone and everything mentioned, with their roles and relevance to the document."""
+                    }
+                ]
             )
-            elapsed_time = time.time() - start_time
-            print(f"   ✅ Character analysis completed in {elapsed_time:.1f}s")
+            
+            print("   ✅ Dramatis personae extracted")
             return response.content[0].text
+            
         except Exception as e:
             print(f"   ❌ Error extracting dramatis personae: {e}")
             return f"Error extracting dramatis personae: {str(e)}"
-    
+
     def create_pdf_summary(self, title: str, content: str, filename: str) -> Path:
-        """Create a PDF file from text content."""
-        print(f"   📄 Creating PDF: {filename}")
+        """Create a formatted PDF from text content."""
+        folder = Path(self.get_pdf_folder())
+        output_path = folder / filename
         
-        output_path = self.output_dir / filename
-        doc = SimpleDocTemplate(str(output_path), pagesize=letter,
-                              rightMargin=72, leftMargin=72,
-                              topMargin=72, bottomMargin=18)
-        
-        # Define styles
+        doc = SimpleDocTemplate(str(output_path), pagesize=letter)
         styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=16,
-            spaceAfter=30,
-            alignment=1  # Center alignment
-        )
-        
-        # Build the document
         story = []
         
-        # Add title
+        # Title
+        title_style = styles['Title']
         story.append(Paragraph(title, title_style))
-        story.append(Spacer(1, 12))
+        story.append(Spacer(1, 0.2*inch))
         
-        # Split content into paragraphs and add to PDF
+        # Content
+        content_style = styles['Normal']
+        
+        # Split content into paragraphs and format
         paragraphs = content.split('\n\n')
         for para in paragraphs:
             if para.strip():
-                # Handle bold text formatting
-                para = para.replace('**', '<b>').replace('**', '</b>')
-                # Create alternating bold tags
-                bold_count = para.count('<b>')
-                for i in range(0, bold_count, 2):
-                    para = para.replace('<b>', '<b>', 1).replace('<b>', '</b>', 1)
+                # Handle bullet points and formatting
+                if para.strip().startswith('- ') or para.strip().startswith('* '):
+                    para = para.replace('- ', '• ').replace('* ', '• ')
                 
-                story.append(Paragraph(para, styles['Normal']))
-                story.append(Spacer(1, 12))
+                story.append(Paragraph(para.strip(), content_style))
+                story.append(Spacer(1, 0.1*inch))
         
-        try:
-            doc.build(story)
-            print(f"   ✅ PDF created: {filename}")
-            return output_path
-        except Exception as e:
-            print(f"   ❌ Error creating PDF {filename}: {e}")
-            # Fallback to text file
-            text_path = output_path.with_suffix('.txt')
-            with open(text_path, 'w', encoding='utf-8') as f:
-                f.write(f"{title}\n{'='*len(title)}\n\n{content}")
-            print(f"   📝 Saved as text file instead: {text_path.name}")
-            return text_path
-    
-    def _cleanup_previous_outputs(self):
-        """Clean up previous output files for a fresh run."""
-        print("🧹 Cleaning up previous outputs...")
-        
-        # Files to clean up
-        cleanup_files = [
-            'concatenated.pdf',
-            'final_summary.pdf',
-            'timeline.pdf',
-            'dramatis_personae.pdf'
-        ]
-        
-        cleaned_count = 0
-        for filename in cleanup_files:
-            file_path = self.output_dir / filename
-            if file_path.exists():
-                file_path.unlink()
-                cleaned_count += 1
-        
-        # Clean up chunk summaries
-        chunk_pattern = self.output_dir.glob('chunk_*_summary.pdf')
-        for chunk_file in chunk_pattern:
-            chunk_file.unlink()
-            cleaned_count += 1
-        
-        if cleaned_count > 0:
-            print(f"   🗑️  Removed {cleaned_count} previous output files")
-        else:
-            print("   ✅ No previous outputs to clean")
-    
+        doc.build(story)
+        return output_path
+
     def process_pdfs(self):
         """Main processing function."""
-        try:
-            # Clean up any existing output files for fresh run
-            self._cleanup_previous_outputs()
+        print("🚀 Starting PDF summarization process...")
+        
+        # Cleanup previous outputs
+        self._cleanup_previous_outputs()
+        
+        # Find and concatenate PDFs
+        pdf_files = self.find_pdf_files()
+        concatenated_pdf = self.concatenate_pdfs(pdf_files)
+        
+        # Create PDF chunks (30 pages with 5-page overlap for coherent summaries)
+        chunk_paths = self.create_pdf_chunks(concatenated_pdf, max_pages=30, overlap=5)
+        
+        # Analyze each chunk with cumulative context
+        chunk_summaries = []
+        cumulative_summary = ""
+        
+        for i, chunk_path in enumerate(chunk_paths, 1):
+            summary = self.analyze_pdf_chunk(chunk_path, i, len(chunk_paths), cumulative_summary)
+            chunk_summaries.append(summary)
             
-            # Find PDF files
-            pdf_files = self.find_pdf_files()
-            print(f"\n🎯 Processing {len(pdf_files)} PDF files")
-            
-            # Concatenate PDFs
-            concatenated_pdf = self.concatenate_pdfs(pdf_files)
-            
-            # Create chunks
-            chunks = self.create_chunks(concatenated_pdf)
-            
-            # Summarize each chunk
-            print(f"\n🔄 Processing {len(chunks)} chunks...")
-            chunk_summaries = []
-            for i, (start_page, end_page, text) in enumerate(chunks):
-                summary = self.summarize_chunk(text, i, len(chunks))
-                chunk_summaries.append(summary)
-                
-                # Save individual chunk summary as PDF
-                chunk_title = f"Chunk {i+1} Summary (Pages {start_page+1}-{end_page})"
-                chunk_filename = f'chunk_{i+1}_pages_{start_page+1}-{end_page}_summary.pdf'
-                self.create_pdf_summary(chunk_title, summary, chunk_filename)
-            
-            print(f"\n📊 Generating comprehensive analysis...")
-            
-            # Generate final summary
-            final_summary = self.generate_final_summary(chunk_summaries)
-            print(f"   💾 Saving final summary...")
-            final_summary_file = self.create_pdf_summary(
-                "Comprehensive Document Summary", 
-                final_summary, 
-                'final_summary.pdf'
-            )
-            
-            # Extract timeline
-            timeline = self.extract_timeline(chunk_summaries)
-            print(f"   💾 Saving timeline...")
-            timeline_file = self.create_pdf_summary(
-                "Chronological Timeline", 
-                timeline, 
-                'timeline.pdf'
-            )
-            
-            # Extract dramatis personae
-            dramatis_personae = self.extract_dramatis_personae(chunk_summaries)
-            print(f"   💾 Saving dramatis personae...")
-            dramatis_file = self.create_pdf_summary(
-                "Dramatis Personae", 
-                dramatis_personae, 
-                'dramatis_personae.pdf'
-            )
-            
-            print(f"\n🎉 Processing complete!")
-            print(f"📁 Results saved in: {self.output_dir}")
-            print(f"📄 Generated files:")
-            print(f"   • Concatenated PDF: concatenated.pdf")
-            print(f"   • Final Summary: final_summary.pdf")
-            print(f"   • Timeline: timeline.pdf")
-            print(f"   • Character List: dramatis_personae.pdf")
-            print(f"   • Individual Summaries: {len(chunks)} chunk summary PDFs")
-            print(f"   • All files saved to: {self.output_dir.absolute()}")
-            
-        except Exception as e:
-            print(f"❌ Error during processing: {e}")
-            sys.exit(1)
+            # Update cumulative summary for next chunk
+            if cumulative_summary:
+                cumulative_summary += f"\n\nCHUNK {i} SUMMARY:\n{summary}"
+            else:
+                cumulative_summary = f"CHUNK {i} SUMMARY:\n{summary}"
+        
+        # Generate outputs
+        print(f"\n📋 Generating final outputs...")
+        
+        final_summary = self.generate_final_summary(chunk_summaries)
+        timeline = self.extract_timeline(chunk_summaries)
+        dramatis_personae = self.extract_dramatis_personae(chunk_summaries)
+        
+        # Create PDF outputs
+        folder = Path(self.get_pdf_folder())
+        base_name = concatenated_pdf.stem
+        
+        summary_pdf = self.create_pdf_summary(
+            f"Summary: {base_name}", 
+            final_summary, 
+            f"{base_name}_summary.pdf"
+        )
+        
+        timeline_pdf = self.create_pdf_summary(
+            f"Timeline: {base_name}", 
+            timeline, 
+            f"{base_name}_timeline.pdf"
+        )
+        
+        dramatis_pdf = self.create_pdf_summary(
+            f"Dramatis Personae: {base_name}", 
+            dramatis_personae, 
+            f"{base_name}_dramatis_personae.pdf"
+        )
+        
+        print(f"\n🎉 Processing complete! Generated files:")
+        print(f"   📄 Summary: {summary_pdf.name}")
+        print(f"   📅 Timeline: {timeline_pdf.name}")
+        print(f"   👥 Dramatis Personae: {dramatis_pdf.name}")
+        print(f"   🗂️  PDF Chunks: {len(chunk_paths)} files")
 
 def main():
     """Main entry point."""
-    print("🚀 PDF Summarization Tool")
-    print("=" * 50)
-    print("📚 This tool will:")
-    print("   • Concatenate your PDF files")
-    print("   • Split into chunks if needed (>100 pages)")
-    print("   • Generate comprehensive summaries using Claude AI")
-    print("   • Create timeline and character analysis")
-    print("   • Save all results as PDF files")
-    print("=" * 50)
-    
     processor = PDFProcessor()
     processor.process_pdfs()
 
